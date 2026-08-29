@@ -11,7 +11,7 @@ from telethon.errors import (
     SessionPasswordNeededError,
     AuthKeyDuplicatedError,
 )
-from telethon.network.connection.connection import ConnectionTcpFull
+from telethon.network.connection.tcpfull import ConnectionTcpFull
 from telethon.tl.functions.payments import SendStarGiftOfferRequest
 from telethon.tl.types import StarsAmount
 
