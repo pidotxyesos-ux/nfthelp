@@ -1,13 +1,10 @@
-```python
 import asyncio
-import os
 import random
 import sqlite3
 import sys
 import time
-from typing import Any
 
-from telethon import TelegramClient, utils
+from telethon import TelegramClient, events, types, utils
 from telethon.errors import (
     FloodWaitError,
     RPCError,
@@ -15,11 +12,7 @@ from telethon.errors import (
     AuthKeyDuplicatedError,
 )
 from telethon.network.connection.connection import ConnectionTcpFull
-from telethon.tl.functions.payments import (
-    GetStarGiftsRequest,
-    GetResaleStarGiftsRequest,
-    SendStarGiftOfferRequest,
-)
+from telethon.tl.functions.payments import SendStarGiftOfferRequest
 from telethon.tl.types import StarsAmount
 
 
@@ -35,90 +28,83 @@ OFFER_STARS = 125
 SESSION_NAME = "buyer"
 DATABASE_NAME = "buyer.sqlite3"
 
-# Telegram permits only these durations for real offers.
-# 21600 = 6 hours
-# 43200 = 12 hours
-# 86400 = 24 hours
+# Telegram production values:
+# 21600  = 6 hours
+# 43200  = 12 hours
+# 86400  = 24 hours
 # 129600 = 36 hours
 # 172800 = 48 hours
 # 259200 = 72 hours
 OFFER_DURATION = 21600
 
-# Polling interval.
-# Lower values mean more API requests.
-POLL_INTERVAL = 3
-
-# Maximum number of resale gifts fetched per page.
-PAGE_LIMIT = 100
-
-# Delay between different base gift types.
-# This helps avoid hammering Telegram if there are many types.
-REQUEST_DELAY = 0.15
-
-# Retry delay after temporary network errors.
-NETWORK_RETRY_DELAY = 5
-
-# Maximum number of attempts for a temporary request error.
-REQUEST_RETRIES = 5
+# Only newly created collectible events.
+# upgrade = regular gift upgraded into collectible
+# craft   = collectible created by crafting
+WATCH_UPGRADES = True
+WATCH_CRAFTS = True
 
 
 # ============================================================
 # LOGGING
 # ============================================================
 
-def log(level: str, message: str) -> None:
-    now = time.strftime("%Y-%m-%d %H:%M:%S")
-    print(f"{now} [{level}] {message}", flush=True)
+def log(level, text):
+    print(
+        f"{time.strftime('%Y-%m-%d %H:%M:%S')} "
+        f"[{level}] {text}",
+        flush=True,
+    )
 
 
-def info(message: str) -> None:
-    log("INFO", message)
+def info(text):
+    log("INFO", text)
 
 
-def nft_log(message: str) -> None:
-    log("NFT", message)
+def nft(text):
+    log("NFT", text)
 
 
-def offer_log(message: str) -> None:
-    log("OFFER", message)
+def offer(text):
+    log("OFFER", text)
 
 
-def success(message: str) -> None:
-    log("SUCCESS", message)
+def success(text):
+    log("SUCCESS", text)
 
 
-def error(message: str) -> None:
-    log("ERROR", message)
+def error(text):
+    log("ERROR", text)
 
 
-def wait_log(message: str) -> None:
-    log("WAIT", message)
+def wait_log(text):
+    log("WAIT", text)
 
 
 # ============================================================
-# SQLITE
+# DATABASE
 # ============================================================
 
 class Database:
-    def __init__(self, filename: str):
+    def __init__(self, filename):
         self.conn = sqlite3.connect(
             filename,
             check_same_thread=False,
         )
+
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
 
         self.conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS gifts (
+            CREATE TABLE IF NOT EXISTS processed_gifts (
                 slug TEXT PRIMARY KEY,
                 gift_id INTEGER,
                 owner_id INTEGER,
                 offer_min_stars INTEGER,
-                random_id INTEGER,
+                random_id INTEGER NOT NULL,
                 status TEXT NOT NULL,
-                first_seen INTEGER NOT NULL,
-                last_update INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
                 error TEXT
             )
             """
@@ -126,115 +112,65 @@ class Database:
 
         self.conn.commit()
 
-    def exists(self, slug: str) -> bool:
-        row = self.conn.execute(
-            "SELECT 1 FROM gifts WHERE slug = ? LIMIT 1",
-            (slug,),
-        ).fetchone()
+        # Prevent two Telegram updates from processing
+        # the same NFT simultaneously.
+        self.lock = asyncio.Lock()
 
-        return row is not None
-
-    def get(self, slug: str):
-        return self.conn.execute(
-            """
-            SELECT
-                slug,
-                gift_id,
-                owner_id,
-                offer_min_stars,
-                random_id,
-                status,
-                first_seen,
-                last_update,
-                error
-            FROM gifts
-            WHERE slug = ?
-            """,
-            (slug,),
-        ).fetchone()
-
-    def create_seen(
+    async def claim(
         self,
-        slug: str,
-        gift_id: int | None,
-        owner_id: int | None,
-        offer_min_stars: int | None,
-        random_id: int,
-    ) -> None:
-        now = int(time.time())
+        slug,
+        gift_id,
+        owner_id,
+        offer_min_stars,
+        random_id,
+    ):
+        """
+        Atomically claim a slug.
 
-        self.conn.execute(
-            """
-            INSERT OR IGNORE INTO gifts (
-                slug,
-                gift_id,
-                owner_id,
-                offer_min_stars,
-                random_id,
-                status,
-                first_seen,
-                last_update,
-                error
+        Returns True only for the first processing attempt.
+        """
+
+        async with self.lock:
+            now = int(time.time())
+
+            cursor = self.conn.execute(
+                """
+                INSERT OR IGNORE INTO processed_gifts (
+                    slug,
+                    gift_id,
+                    owner_id,
+                    offer_min_stars,
+                    random_id,
+                    status,
+                    created_at,
+                    updated_at,
+                    error
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    slug,
+                    gift_id,
+                    owner_id,
+                    offer_min_stars,
+                    random_id,
+                    "processing",
+                    now,
+                    now,
+                ),
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
-            """,
-            (
-                slug,
-                gift_id,
-                owner_id,
-                offer_min_stars,
-                random_id,
-                "seen",
-                now,
-                now,
-            ),
-        )
 
-        self.conn.commit()
+            self.conn.commit()
 
-    def mark_attempt(
-        self,
-        slug: str,
-        gift_id: int | None,
-        owner_id: int | None,
-        offer_min_stars: int | None,
-        random_id: int,
-    ) -> None:
-        now = int(time.time())
+            return cursor.rowcount == 1
 
+    def mark_success(self, slug):
         self.conn.execute(
             """
-            UPDATE gifts
+            UPDATE processed_gifts
             SET
-                gift_id = ?,
-                owner_id = ?,
-                offer_min_stars = ?,
-                random_id = ?,
-                status = ?,
-                last_update = ?,
-                error = NULL
-            WHERE slug = ?
-            """,
-            (
-                gift_id,
-                owner_id,
-                offer_min_stars,
-                random_id,
-                "offer_attempted",
-                now,
-                slug,
-            ),
-        )
-
-        self.conn.commit()
-
-    def mark_success(self, slug: str) -> None:
-        self.conn.execute(
-            """
-            UPDATE gifts
-            SET
-                status = 'offered',
-                last_update = ?,
+                status = 'offer_sent',
+                updated_at = ?,
                 error = NULL
             WHERE slug = ?
             """,
@@ -246,26 +182,26 @@ class Database:
 
         self.conn.commit()
 
-    def mark_failed(self, slug: str, message: str) -> None:
+    def mark_failed(self, slug, message):
         self.conn.execute(
             """
-            UPDATE gifts
+            UPDATE processed_gifts
             SET
                 status = 'failed',
-                last_update = ?,
+                updated_at = ?,
                 error = ?
             WHERE slug = ?
             """,
             (
                 int(time.time()),
-                message[:1000],
+                message[:2000],
                 slug,
             ),
         )
 
         self.conn.commit()
 
-    def close(self) -> None:
+    def close(self):
         self.conn.close()
 
 
@@ -273,37 +209,39 @@ class Database:
 # AUTH
 # ============================================================
 
-async def interactive_login(client: TelegramClient) -> bool:
+async def first_login(client):
     """
-    Explicit first-run login.
+    Interactive first login.
 
-    We don't call client.start() blindly because client.start()
-    can call input() internally and produce EOFError in a Docker
-    container without stdin.
+    buyer.session is then reused automatically.
     """
 
     if not sys.stdin.isatty():
         error(
-            "Первый запуск требует интерактивный stdin. "
-            "Запусти контейнер с интерактивным stdin, например "
-            "`docker run -it ...`, либо один раз создай buyer.session "
-            "локально и перенеси session-файл в контейнер."
+            "Первый запуск требует интерактивный stdin.\n"
+            "На хостинге проще один раз авторизовать аккаунт "
+            "локально, получить buyer.session и загрузить "
+            "buyer.session рядом с main.py."
         )
         return False
 
     try:
-        phone = input("Введите номер телефона Telegram: ").strip()
+        phone = input(
+            "Введите номер телефона Telegram: "
+        ).strip()
 
         if not phone:
-            error("Номер телефона не указан.")
+            error("Номер телефона пустой.")
             return False
 
         await client.send_code_request(phone)
 
-        code = input("Введите код из Telegram: ").strip()
+        code = input(
+            "Введите код из Telegram: "
+        ).strip()
 
         if not code:
-            error("Код авторизации не указан.")
+            error("Код пустой.")
             return False
 
         try:
@@ -313,38 +251,42 @@ async def interactive_login(client: TelegramClient) -> bool:
             )
 
         except SessionPasswordNeededError:
-            password = input("Введите пароль двухфакторной аутентификации: ")
+            password = input(
+                "Введите пароль 2FA: "
+            )
 
-            if not password:
-                error("Пароль 2FA не указан.")
-                return False
-
-            await client.sign_in(password=password)
+            await client.sign_in(
+                password=password
+            )
 
         if not await client.is_user_authorized():
             error("Telegram не подтвердил авторизацию.")
             return False
 
-        success("Авторизация выполнена.")
+        success("Авторизация успешно выполнена.")
         return True
 
     except EOFError:
         error(
-            "stdin недоступен. Первый запуск необходимо выполнить "
-            "в интерактивном терминале."
+            "stdin недоступен.\n"
+            "Авторизуй buyer.session интерактивно "
+            "и загрузи его на хостинг."
         )
         return False
 
     except KeyboardInterrupt:
-        error("Авторизация прервана пользователем.")
+        error("Авторизация отменена.")
         return False
 
     except Exception as exc:
-        error(f"Ошибка авторизации: {type(exc).__name__}: {exc}")
+        error(
+            f"Ошибка авторизации: "
+            f"{type(exc).__name__}: {exc}"
+        )
         return False
 
 
-async def connect_and_authorize(client: TelegramClient) -> bool:
+async def connect(client):
     try:
         await client.connect()
 
@@ -357,626 +299,565 @@ async def connect_and_authorize(client: TelegramClient) -> bool:
                 else str(me.id)
             )
 
-            success(f"Session загружена: {username}")
+            success(
+                f"Session загружена. Аккаунт: {username}"
+            )
+
             return True
 
-        return await interactive_login(client)
+        return await first_login(client)
 
     except AuthKeyDuplicatedError:
         error(
-            "Telegram отклонил session: AuthKeyDuplicatedError. "
-            "Не используй один и тот же buyer.session одновременно "
-            "в нескольких независимых инстансах."
+            "buyer.session используется одновременно "
+            "в другом месте."
         )
         return False
 
     except Exception as exc:
-        error(f"Ошибка подключения: {type(exc).__name__}: {exc}")
+        error(
+            f"Ошибка подключения: "
+            f"{type(exc).__name__}: {exc}"
+        )
         return False
 
 
 # ============================================================
-# TELEGRAM HELPERS
+# PEER
 # ============================================================
 
-def get_peer_numeric_id(peer: Any) -> int | None:
-    if peer is None:
+async def get_owner_peer(client, owner_id):
+    """
+    starGiftUnique.owner_id is a Peer.
+
+    sendStarGiftOffer requires InputPeer.
+    """
+
+    if owner_id is None:
         return None
 
     try:
-        return int(utils.get_peer_id(peer))
-    except Exception:
-        return None
-
-
-async def resolve_owner_input_peer(
-    client: TelegramClient,
-    owner_peer: Any,
-):
-    """
-    Converts Telegram Peer/User/Channel object to an InputPeer
-    suitable for payments.sendStarGiftOffer.
-    """
-
-    if owner_peer is None:
-        return None
-
-    try:
-        return await client.get_input_entity(owner_peer)
+        return await client.get_input_entity(owner_id)
     except Exception:
         pass
 
-    numeric_id = get_peer_numeric_id(owner_peer)
-
-    if numeric_id is None:
-        return None
-
     try:
+        numeric_id = utils.get_peer_id(owner_id)
         return await client.get_input_entity(numeric_id)
     except Exception:
         return None
 
 
-def is_collectible(gift: Any) -> bool:
+def get_numeric_owner_id(owner_id):
+    if owner_id is None:
+        return None
+
+    try:
+        return utils.get_peer_id(owner_id)
+    except Exception:
+        return None
+
+
+# ============================================================
+# OFFER
+# ============================================================
+
+async def send_offer(
+    client,
+    db,
+    gift,
+):
     """
-    A resale result representing a collectible has the fields
-    defined by Telegram's starGiftUnique constructor.
+    Send official Telegram purchase offer.
     """
 
-    return (
-        gift is not None
-        and getattr(gift, "slug", None) is not None
-        and getattr(gift, "owner_id", None) is not None
-        and hasattr(gift, "offer_min_stars")
+    # --------------------------------------------------------
+    # Basic validation
+    # --------------------------------------------------------
+
+    slug = getattr(gift, "slug", None)
+
+    if not slug:
+        error("NFT без slug. Пропуск.")
+        return
+
+    owner = getattr(gift, "owner_id", None)
+
+    if owner is None:
+        error(
+            f"{slug}: owner_id отсутствует. "
+            f"Offer невозможен."
+        )
+        return
+
+    owner_numeric_id = get_numeric_owner_id(owner)
+
+    if owner_numeric_id is None:
+        error(
+            f"{slug}: невозможно определить owner_id."
+        )
+        return
+
+    # If offer_min_stars doesn't exist, Telegram does not
+    # advertise that purchase offers are available.
+    offer_min = getattr(
+        gift,
+        "offer_min_stars",
+        None,
+    )
+
+    if offer_min is None:
+        info(
+            f"{slug}: offer для этого NFT "
+            f"не разрешён Telegram."
+        )
+        return
+
+    try:
+        offer_min = int(offer_min)
+    except Exception:
+        error(
+            f"{slug}: некорректный offer_min_stars."
+        )
+        return
+
+    # --------------------------------------------------------
+    # Check price
+    # --------------------------------------------------------
+
+    if OFFER_STARS < offer_min:
+        info(
+            f"{slug}: minimum offer = "
+            f"{offer_min} ⭐, "
+            f"наш offer = {OFFER_STARS} ⭐. Skip."
+        )
+        return
+
+    # --------------------------------------------------------
+    # Skip burned collectibles
+    # --------------------------------------------------------
+
+    if getattr(gift, "burned", False):
+        info(
+            f"{slug}: NFT уже burned. Skip."
+        )
+        return
+
+    # --------------------------------------------------------
+    # Skip TON-only gifts
+    # --------------------------------------------------------
+
+    if getattr(gift, "resale_ton_only", False):
+        info(
+            f"{slug}: gift помечен resale_ton_only. Skip."
+        )
+        return
+
+    # --------------------------------------------------------
+    # Generate persistent random_id.
+    #
+    # Telegram uses this to deduplicate the same offer
+    # in case of network problems.
+    # --------------------------------------------------------
+
+    random_id = random.getrandbits(63)
+
+    # --------------------------------------------------------
+    # Claim NFT in SQLite.
+    #
+    # If another update contains the same slug,
+    # it will be ignored.
+    # --------------------------------------------------------
+
+    claimed = await db.claim(
+        slug=slug,
+        gift_id=int(getattr(gift, "gift_id", 0)),
+        owner_id=int(owner_numeric_id),
+        offer_min_stars=offer_min,
+        random_id=random_id,
+    )
+
+    if not claimed:
+        info(
+            f"{slug}: уже обработан. Skip."
+        )
+        return
+
+    nft(
+        f"New collectible detected: {slug}"
+    )
+
+    nft(
+        f"Owner: {owner_numeric_id}"
+    )
+
+    nft(
+        f"Minimum offer: {offer_min} ⭐"
+    )
+
+    # --------------------------------------------------------
+    # Resolve owner to InputPeer
+    # --------------------------------------------------------
+
+    peer = await get_owner_peer(
+        client,
+        owner,
+    )
+
+    if peer is None:
+        error(
+            f"{slug}: невозможно получить InputPeer владельца."
+        )
+
+        db.mark_failed(
+            slug,
+            "Unable to resolve owner InputPeer",
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # SEND OFFER
+    # --------------------------------------------------------
+
+    offer(
+        f"Sending {OFFER_STARS} ⭐ offer "
+        f"for {slug} to {owner_numeric_id}"
+    )
+
+    try:
+        price = StarsAmount(
+            stars=OFFER_STARS,
+            nanos=0,
+        )
+
+        await client(
+            SendStarGiftOfferRequest(
+                peer=peer,
+                slug=slug,
+                price=price,
+                duration=OFFER_DURATION,
+                random_id=random_id,
+            )
+        )
+
+        db.mark_success(slug)
+
+        success(
+            f"Offer sent successfully: "
+            f"{slug} → {OFFER_STARS} ⭐"
+        )
+
+    except FloodWaitError as exc:
+        wait_log(
+            f"FloodWait: {exc.seconds} seconds"
+        )
+
+        await asyncio.sleep(
+            exc.seconds + 1
+        )
+
+        # We intentionally DO NOT generate another
+        # random_id. The original random_id is stored
+        # in SQLite.
+        #
+        # We also don't blindly resend because the RPC
+        # may have been accepted before FloodWait/network
+        # interruption.
+
+        db.mark_failed(
+            slug,
+            f"FloodWait: {exc.seconds}",
+        )
+
+    except RPCError as exc:
+        error(
+            f"Offer failed for {slug}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+        db.mark_failed(
+            slug,
+            f"{type(exc).__name__}: {exc}",
+        )
+
+    except (
+        OSError,
+        ConnectionError,
+        asyncio.TimeoutError,
+    ) as exc:
+        error(
+            f"Network error while sending offer "
+            f"for {slug}: {exc}"
+        )
+
+        db.mark_failed(
+            slug,
+            f"Network error: {exc}",
+        )
+
+    except Exception as exc:
+        error(
+            f"Unexpected offer error for {slug}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+        db.mark_failed(
+            slug,
+            f"{type(exc).__name__}: {exc}",
+        )
+
+
+# ============================================================
+# NFT DETECTION
+# ============================================================
+
+async def process_message(
+    client,
+    db,
+    message,
+):
+    """
+    Detect messageActionStarGiftUnique.
+
+    We specifically watch events representing creation of
+    a collectible:
+        upgrade=True
+        craft=True
+
+    Transfers/saves/refunds are ignored.
+    """
+
+    action = getattr(
+        message,
+        "action",
+        None,
+    )
+
+    if action is None:
+        return
+
+    if not isinstance(
+        action,
+        types.MessageActionStarGiftUnique,
+    ):
+        return
+
+    # --------------------------------------------------------
+    # Determine why the collectible appeared.
+    # --------------------------------------------------------
+
+    is_upgrade = bool(
+        getattr(action, "upgrade", False)
+    )
+
+    is_craft = bool(
+        getattr(action, "craft", False)
+    )
+
+    if is_upgrade and not WATCH_UPGRADES:
+        return
+
+    if is_craft and not WATCH_CRAFTS:
+        return
+
+    # If neither flag is set, this is most likely a transfer,
+    # assignment, save, refund, etc., rather than creation.
+    if not is_upgrade and not is_craft:
+        return
+
+    gift = getattr(
+        action,
+        "gift",
+        None,
+    )
+
+    if gift is None:
+        return
+
+    # --------------------------------------------------------
+    # Confirm collectible.
+    #
+    # Telegram's unique collectible has slug + owner_id.
+    # --------------------------------------------------------
+
+    slug = getattr(
+        gift,
+        "slug",
+        None,
+    )
+
+    owner_id = getattr(
+        gift,
+        "owner_id",
+        None,
+    )
+
+    if not slug:
+        return
+
+    if owner_id is None:
+        # Telegram can represent TON-owned/hosted gifts
+        # without a Telegram owner_id. Such a gift cannot
+        # be targeted by sendStarGiftOffer.
+        info(
+            f"{slug}: owner_id отсутствует. "
+            f"Offer пропущен."
+        )
+        return
+
+    if is_upgrade:
+        nft(
+            f"Detected NEW collectible by upgrade: "
+            f"{slug}"
+        )
+
+    elif is_craft:
+        nft(
+            f"Detected NEW collectible by craft: "
+            f"{slug}"
+        )
+
+    await send_offer(
+        client,
+        db,
+        gift,
     )
 
 
 # ============================================================
-# GET BASE GIFT TYPES
+# EVENT HANDLER
 # ============================================================
 
-async def get_resellable_base_gift_ids(
-    client: TelegramClient,
-) -> list[int]:
-    """
-    Telegram's getResaleStarGifts requires a base gift_id.
-
-    getStarGifts returns the catalogue of base gifts.
-    Gifts with availability_resale set are the types for which
-    Telegram indicates resale availability.
-    """
-
-    for attempt in range(REQUEST_RETRIES):
-        try:
-            result = await client(
-                GetStarGiftsRequest(
-                    hash=0,
-                )
-            )
-
-            gifts = getattr(result, "gifts", []) or []
-
-            ids = []
-
-            for gift in gifts:
-                gift_id = getattr(gift, "id", None)
-
-                if gift_id is None:
-                    continue
-
-                availability_resale = getattr(
-                    gift,
-                    "availability_resale",
-                    None,
-                )
-
-                # Telegram uses this optional field to indicate
-                # that gifts of this type can exist on resale.
-                if availability_resale is not None:
-                    ids.append(int(gift_id))
-
-            # Some environments/versions may not expose the
-            # optional field exactly as expected. In that case,
-            # keep every base gift with upgrade variants.
-            if not ids:
-                for gift in gifts:
-                    gift_id = getattr(gift, "id", None)
-
-                    if gift_id is None:
-                        continue
-
-                    upgrade_variants = getattr(
-                        gift,
-                        "upgrade_variants",
-                        None,
-                    )
-
-                    if upgrade_variants:
-                        ids.append(int(gift_id))
-
-            return sorted(set(ids))
-
-        except FloodWaitError as exc:
-            wait_log(
-                f"FloodWait при получении списка gift types: "
-                f"{exc.seconds} секунд"
-            )
-            await asyncio.sleep(exc.seconds + 1)
-
-        except (OSError, ConnectionError, asyncio.TimeoutError) as exc:
-            if attempt == REQUEST_RETRIES - 1:
-                raise
-
-            wait_log(
-                f"Сеть временно недоступна: {exc}. "
-                f"Повтор через {NETWORK_RETRY_DELAY} сек."
-            )
-            await asyncio.sleep(NETWORK_RETRY_DELAY)
-
-        except RPCError:
-            raise
-
-    return []
-
-
-# ============================================================
-# RESALE SCANNING
-# ============================================================
-
-async def fetch_resale_page(
-    client: TelegramClient,
-    gift_id: int,
-    offset: str = "",
+def install_handlers(
+    client,
+    db,
 ):
-    """
-    Fetch one page from Telegram's official collectible resale
-    catalogue.
-    """
-
-    for attempt in range(REQUEST_RETRIES):
+    @client.on(events.NewMessage)
+    async def new_message_handler(event):
         try:
-            result = await client(
-                GetResaleStarGiftsRequest(
-                    sort_by_price=False,
-                    sort_by_num=False,
-                    for_craft=False,
-                    stars_only=True,
-                    attributes_hash=None,
-                    gift_id=gift_id,
-                    attributes=None,
-                    offset=offset,
-                    limit=PAGE_LIMIT,
-                )
-            )
-
-            return result
-
-        except FloodWaitError:
-            raise
-
-        except (OSError, ConnectionError, asyncio.TimeoutError) as exc:
-            if attempt == REQUEST_RETRIES - 1:
-                raise
-
-            wait_log(
-                f"Временная ошибка сети: {exc}. "
-                f"Повтор через {NETWORK_RETRY_DELAY} сек."
-            )
-
-            await asyncio.sleep(NETWORK_RETRY_DELAY)
-
-        except RPCError:
-            raise
-
-    return None
-
-
-async def scan_gift_type(
-    client: TelegramClient,
-    db: Database,
-    gift_id: int,
-) -> int:
-    """
-    Scan all currently returned resale pages for one base gift type.
-    """
-
-    offset = ""
-    processed = 0
-
-    while True:
-        result = await fetch_resale_page(
-            client,
-            gift_id,
-            offset,
-        )
-
-        if result is None:
-            break
-
-        gifts = getattr(result, "gifts", []) or []
-        users = getattr(result, "users", []) or []
-
-        # Build user cache from the users vector returned by Telegram.
-        users_by_id = {}
-
-        for user in users:
-            try:
-                users_by_id[int(user.id)] = user
-            except Exception:
-                pass
-
-        for gift in gifts:
-            if not is_collectible(gift):
-                continue
-
-            slug = getattr(gift, "slug", None)
-
-            if not slug:
-                continue
-
-            owner_peer = getattr(gift, "owner_id", None)
-
-            if owner_peer is None:
-                continue
-
-            owner_id = get_peer_numeric_id(owner_peer)
-
-            # If Telegram gave us PeerUser and also supplied the
-            # complete user object, prefer the actual User object.
-            owner_user = None
-
-            try:
-                raw_user_id = getattr(owner_peer, "user_id", None)
-
-                if raw_user_id is not None:
-                    owner_user = users_by_id.get(int(raw_user_id))
-            except Exception:
-                owner_user = None
-
-            if owner_user is not None:
-                owner_id = int(owner_user.id)
-
-            offer_min = getattr(
-                gift,
-                "offer_min_stars",
-                None,
-            )
-
-            if offer_min is None:
-                # Telegram only allows an offer if this field exists.
-                continue
-
-            try:
-                offer_min = int(offer_min)
-            except Exception:
-                continue
-
-            # Generate random_id once and persist it before the RPC.
-            # If the network dies after Telegram accepted the request,
-            # the same random_id can safely be reused.
-            existing = db.get(slug)
-
-            if existing is not None:
-                status = existing[5]
-
-                # Never intentionally submit a second offer for the
-                # same slug after a previous successful/attempted offer.
-                if status in (
-                    "offer_attempted",
-                    "offered",
-                ):
-                    continue
-
-                random_id = int(existing[4])
-            else:
-                random_id = random.getrandbits(63)
-
-                db.create_seen(
-                    slug=slug,
-                    gift_id=int(getattr(gift, "gift_id", gift_id)),
-                    owner_id=owner_id,
-                    offer_min_stars=offer_min,
-                    random_id=random_id,
-                )
-
-            nft_log(f"Found collectible gift: {slug}")
-            nft_log(f"Owner: {owner_id}")
-            nft_log(f"Offer minimum: {offer_min} ⭐")
-
-            # Telegram explicitly says offer_min_stars is the minimum
-            # Stars offer accepted for that collectible.
-            if OFFER_STARS < offer_min:
-                info(
-                    f"Skip {slug}: minimum offer is "
-                    f"{offer_min} ⭐, configured offer is "
-                    f"{OFFER_STARS} ⭐."
-                )
-                db.mark_failed(
-                    slug,
-                    f"Minimum offer is {offer_min}, "
-                    f"configured amount is {OFFER_STARS}",
-                )
-                continue
-
-            # At this point Telegram's collectible object tells us:
-            # - it is unique/collectible
-            # - it has an owner
-            # - an offer minimum exists
-            # - 125 Stars meets that minimum
-            #
-            # Resolve the current owner to InputPeer.
-            peer = await resolve_owner_input_peer(
+            await process_message(
                 client,
-                owner_user if owner_user is not None else owner_peer,
+                db,
+                event.message,
             )
-
-            if peer is None:
-                error(
-                    f"Не удалось получить InputPeer владельца "
-                    f"для {slug}."
-                )
-                db.mark_failed(
-                    slug,
-                    "Could not resolve owner InputPeer",
-                )
-                continue
-
-            # Mark before sending to prevent another polling pass
-            # from submitting another offer concurrently.
-            db.mark_attempt(
-                slug=slug,
-                gift_id=int(getattr(gift, "gift_id", gift_id)),
-                owner_id=owner_id,
-                offer_min_stars=offer_min,
-                random_id=random_id,
-            )
-
-            offer_log(
-                f"Sending {OFFER_STARS} ⭐ "
-                f"for {slug} to {owner_id}"
-            )
-
-            try:
-                price = StarsAmount(
-                    stars=OFFER_STARS,
-                    nanos=0,
-                )
-
-                await client(
-                    SendStarGiftOfferRequest(
-                        peer=peer,
-                        slug=slug,
-                        price=price,
-                        duration=OFFER_DURATION,
-                        random_id=random_id,
-                    )
-                )
-
-                db.mark_success(slug)
-
-                success(
-                    f"Offer sent: {slug} | "
-                    f"{OFFER_STARS} ⭐ | "
-                    f"owner={owner_id}"
-                )
-
-            except FloodWaitError as exc:
-                # The attempt was already registered in SQLite.
-                # We do NOT generate another random_id.
-                # If Telegram did not accept the request, the next
-                # manual/restart strategy can reuse the same ID.
-                wait_log(
-                    f"FloodWait: {exc.seconds} seconds"
-                )
-                await asyncio.sleep(exc.seconds + 1)
-
-            except RPCError as exc:
-                error(
-                    f"Offer RPC error for {slug}: "
-                    f"{type(exc).__name__}: {exc}"
-                )
-
-                db.mark_failed(
-                    slug,
-                    f"{type(exc).__name__}: {exc}",
-                )
-
-            except (OSError, ConnectionError, asyncio.TimeoutError) as exc:
-                # Do not immediately mark the transaction as successful.
-                # The random_id is persisted, so the same request ID can
-                # be used later if the implementation is extended to retry
-                # uncertain network outcomes.
-                error(
-                    f"Network error while sending offer "
-                    f"for {slug}: {exc}"
-                )
-
-                db.mark_failed(
-                    slug,
-                    f"Network error: {exc}",
-                )
-
-            processed += 1
-
-        next_offset = getattr(
-            result,
-            "next_offset",
-            None,
-        )
-
-        if not next_offset:
-            break
-
-        if next_offset == offset:
-            break
-
-        offset = next_offset
-
-        await asyncio.sleep(REQUEST_DELAY)
-
-    return processed
-
-
-# ============================================================
-# MAIN SCANNER
-# ============================================================
-
-async def scanner_loop(
-    client: TelegramClient,
-    db: Database,
-) -> None:
-
-    info("Получение списка типов collectible gifts...")
-
-    while True:
-        try:
-            gift_ids = await get_resellable_base_gift_ids(client)
-
-            if not gift_ids:
-                info(
-                    "Telegram не вернул типы gift с resale availability. "
-                    f"Следующая проверка через {POLL_INTERVAL} сек."
-                )
-
-                await asyncio.sleep(POLL_INTERVAL)
-                continue
-
-            info(
-                f"Доступно для проверки base gift types: "
-                f"{len(gift_ids)}"
-            )
-
-            for gift_id in gift_ids:
-                try:
-                    await scan_gift_type(
-                        client,
-                        db,
-                        gift_id,
-                    )
-
-                except FloodWaitError as exc:
-                    wait_log(
-                        f"FloodWait: {exc.seconds} секунд"
-                    )
-                    await asyncio.sleep(exc.seconds + 1)
-
-                except (OSError, ConnectionError, asyncio.TimeoutError) as exc:
-                    error(
-                        f"Network error while scanning gift "
-                        f"{gift_id}: {exc}"
-                    )
-
-                    await asyncio.sleep(
-                        NETWORK_RETRY_DELAY
-                    )
-
-                except RPCError as exc:
-                    error(
-                        f"RPC error while scanning gift "
-                        f"{gift_id}: "
-                        f"{type(exc).__name__}: {exc}"
-                    )
-
-                except Exception as exc:
-                    error(
-                        f"Unexpected error while scanning "
-                        f"gift {gift_id}: "
-                        f"{type(exc).__name__}: {exc}"
-                    )
-
-                await asyncio.sleep(REQUEST_DELAY)
-
-            wait_log(
-                f"Scan complete. Next scan in "
-                f"{POLL_INTERVAL} seconds."
-            )
-
-            await asyncio.sleep(POLL_INTERVAL)
 
         except FloodWaitError as exc:
             wait_log(
-                f"Global FloodWait: {exc.seconds} seconds"
-            )
-            await asyncio.sleep(exc.seconds + 1)
-
-        except AuthKeyDuplicatedError:
-            error(
-                "Session была использована в другом месте. "
-                "Остановка."
-            )
-            return
-
-        except (OSError, ConnectionError, asyncio.TimeoutError) as exc:
-            error(
-                f"Connection error: {exc}. "
-                f"Reconnect in {NETWORK_RETRY_DELAY} sec."
-            )
-
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
-
-            await asyncio.sleep(NETWORK_RETRY_DELAY)
-
-            try:
-                await client.connect()
-
-                if not await client.is_user_authorized():
-                    error("Session больше не авторизована.")
-                    return
-
-                success("Reconnect successful.")
-
-            except Exception as reconnect_exc:
-                error(
-                    f"Reconnect failed: "
-                    f"{type(reconnect_exc).__name__}: "
-                    f"{reconnect_exc}"
-                )
-
-                await asyncio.sleep(
-                    NETWORK_RETRY_DELAY
-                )
-
-        except RPCError as exc:
-            error(
-                f"Global RPC error: "
-                f"{type(exc).__name__}: {exc}"
+                f"FloodWait in event handler: "
+                f"{exc.seconds} seconds"
             )
 
             await asyncio.sleep(
-                NETWORK_RETRY_DELAY
+                exc.seconds + 1
+            )
+
+        except (
+            OSError,
+            ConnectionError,
+            asyncio.TimeoutError,
+        ) as exc:
+            error(
+                f"Temporary network error: {exc}"
+            )
+
+        except RPCError as exc:
+            error(
+                f"Telegram RPC error: "
+                f"{type(exc).__name__}: {exc}"
             )
 
         except Exception as exc:
             error(
-                f"Scanner exception: "
+                f"Event handler error: "
                 f"{type(exc).__name__}: {exc}"
             )
 
-            await asyncio.sleep(
-                NETWORK_RETRY_DELAY
+
+# ============================================================
+# CONNECTION WATCHDOG
+# ============================================================
+
+async def connection_watchdog(client):
+    while True:
+        try:
+            if not client.is_connected():
+                wait_log(
+                    "Telegram disconnected. Reconnecting..."
+                )
+
+                await client.connect()
+
+                if await client.is_user_authorized():
+                    success(
+                        "Telegram connection restored."
+                    )
+                else:
+                    error(
+                        "Session is no longer authorized."
+                    )
+                    return
+
+        except FloodWaitError as exc:
+            wait_log(
+                f"Reconnect FloodWait: "
+                f"{exc.seconds} seconds"
             )
 
+            await asyncio.sleep(
+                exc.seconds + 1
+            )
+
+        except Exception as exc:
+            error(
+                f"Reconnect error: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+            await asyncio.sleep(5)
+
+        await asyncio.sleep(5)
+
 
 # ============================================================
-# ENTRY POINT
+# MAIN
 # ============================================================
 
-async def main() -> None:
-    if API_ID == 123456 or API_HASH == "YOUR_API_HASH":
+async def main():
+    if API_ID == 123456:
         error(
-            "Сначала укажи реальные API_ID и API_HASH "
-            "в начале main.py."
+            "Укажи настоящий API_ID в начале main.py."
         )
         return
 
-    if not isinstance(API_ID, int):
-        error("API_ID должен быть integer.")
+    if API_HASH == "YOUR_API_HASH":
+        error(
+            "Укажи настоящий API_HASH в начале main.py."
+        )
         return
 
-    db = Database(DATABASE_NAME)
+    if OFFER_STARS <= 0:
+        error(
+            "OFFER_STARS должен быть больше 0."
+        )
+        return
+
+    if OFFER_DURATION not in (
+        21600,
+        43200,
+        86400,
+        129600,
+        172800,
+        259200,
+    ):
+        error(
+            "Некорректная OFFER_DURATION."
+        )
+        return
+
+    db = Database(
+        DATABASE_NAME
+    )
 
     client = TelegramClient(
         SESSION_NAME,
@@ -984,53 +865,68 @@ async def main() -> None:
         API_HASH,
         connection=ConnectionTcpFull,
         auto_reconnect=True,
-        connection_retries=5,
+        connection_retries=10,
         retry_delay=5,
         request_retries=5,
     )
 
     try:
-        authorized = await connect_and_authorize(client)
-
-        if not authorized:
+        if not await connect(client):
             return
 
         me = await client.get_me()
 
         info(
-            f"Account ID: {me.id}"
+            f"Logged in as: "
+            f"{getattr(me, 'username', None) or me.id}"
         )
 
         info(
-            "Telegram collectible gift monitor started."
+            f"Offer: {OFFER_STARS} ⭐"
         )
 
         info(
-            f"Offer amount: {OFFER_STARS} ⭐"
+            f"Offer duration: "
+            f"{OFFER_DURATION} seconds"
         )
 
         info(
-            f"Offer duration: {OFFER_DURATION} seconds"
+            "NFT auto-offer monitor started."
         )
 
         info(
-            "Monitoring official Telegram resale catalogue."
+            "Waiting for new collectible "
+            "upgrade/craft events..."
         )
 
-        await scanner_loop(
+        install_handlers(
             client,
             db,
         )
 
-    except KeyboardInterrupt:
-        info("Остановка пользователем.")
+        watchdog = asyncio.create_task(
+            connection_watchdog(client)
+        )
+
+        try:
+            await client.run_until_disconnected()
+
+        finally:
+            watchdog.cancel()
+
+            try:
+                await watchdog
+            except asyncio.CancelledError:
+                pass
 
     except AuthKeyDuplicatedError:
         error(
-            "AuthKeyDuplicatedError: "
-            "не используй одну session одновременно "
-            "в нескольких процессах."
+            "buyer.session используется "
+            "в другом процессе."
         )
+
+    except KeyboardInterrupt:
+        info("Stopped by user.")
 
     except Exception as exc:
         error(
@@ -1046,13 +942,9 @@ async def main() -> None:
         except Exception:
             pass
 
-        info("Stopped.")
-
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         print()
-        info("Stopped by user.")
-```
